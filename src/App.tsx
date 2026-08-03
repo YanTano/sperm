@@ -28,9 +28,8 @@ export default function App() {
         <GameScene />
         <EffectComposer>
           <Bloom
-            luminanceThreshold={1.5}
-            mipmapBlur
-            intensity={1.5}
+            luminanceThreshold={0.8}
+            intensity={1.2}
           />
         </EffectComposer>
       </Canvas>
