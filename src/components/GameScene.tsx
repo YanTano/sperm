@@ -313,6 +313,7 @@ export function GameScene() {
     currentAngle: number;
     isBoosting: boolean;
     lastSendTime: number;
+    invincibleTime: number;
   }>({
     active: false,
     segments: [],
@@ -320,6 +321,7 @@ export function GameScene() {
     currentAngle: 0,
     isBoosting: false,
     lastSendTime: 0,
+    invincibleTime: 0,
   });
 
   useEffect(() => {
@@ -369,8 +371,15 @@ export function GameScene() {
     const serverPlayer = gs.players[playerId];
     if (serverPlayer && serverPlayer.state === 'alive') {
       
-      // Initialize from server if not active
-      if (!localPlayerRef.current.active && serverPlayer.segments.length > 0) {
+      // Initialize or re-sync from server if not active or if new spawn occurred
+      const needsInit = !localPlayerRef.current.active || 
+                        localPlayerRef.current.segments.length === 0 ||
+                        (serverPlayer.segments.length > 0 && 
+                         localPlayerRef.current.segments[0] &&
+                         Math.hypot(localPlayerRef.current.segments[0].x - serverPlayer.segments[0].x,
+                                    localPlayerRef.current.segments[0].y - serverPlayer.segments[0].y) > 25);
+
+      if (needsInit && serverPlayer.segments.length > 0) {
         localPlayerRef.current.active = true;
         localPlayerRef.current.segments = serverPlayer.segments.map(s => ({ x: s.x || 0, y: s.y || 0 }));
         localPlayerRef.current.score = serverPlayer.score || 10;
@@ -378,6 +387,7 @@ export function GameScene() {
           ? serverPlayer.currentAngle
           : ((serverPlayer as any).angle || 0);
         localPlayerRef.current.currentAngle = validAngle;
+        localPlayerRef.current.invincibleTime = 3.0; // 3 seconds spawn protection
       }
 
       
@@ -385,6 +395,11 @@ export function GameScene() {
 
       if (isNaN(localPlayerRef.current.currentAngle)) {
         localPlayerRef.current.currentAngle = 0;
+      }
+      
+      // Decrement invincibility timer
+      if (localPlayerRef.current.invincibleTime > 0) {
+        localPlayerRef.current.invincibleTime -= delta;
       }
 
       // Local movement logic
@@ -445,15 +460,16 @@ export function GameScene() {
       }
 
       // Check player collisions
+      if (localPlayerRef.current.invincibleTime <= 0) {
       let collided = false;
       for (const otherId in gs.players) {
         if (otherId === playerId) continue;
         const other = gs.players[otherId];
-        if (other.state !== 'alive') continue;
+        if (other.state !== 'alive' || !other.segments) continue;
         for (const seg of other.segments) {
           const dx = head.x - seg.x;
           const dy = head.y - seg.y;
-          if (dx * dx + dy * dy < 2.25) {
+          if (dx * dx + dy * dy < 2.0) {
             collided = true;
             break;
           }
@@ -474,6 +490,7 @@ export function GameScene() {
           state: 'dead'
         });
         return;
+        }
       }
 
       // Overwrite global state for local rendering
