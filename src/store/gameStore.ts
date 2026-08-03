@@ -16,6 +16,35 @@ const CELL_COLORS = [
   '#50fa7b', // Mint Pearl
 ];
 
+const BOT_NAMES = ['ViperCell', 'TurboSperm', 'PearlSwimmer', 'AcroCap', 'GridGamete', 'AquaMotile'];
+
+interface LocalUser {
+  id: string;
+  username: string;
+  passwordHash: string;
+  color: string;
+  highScore: number;
+  gamesPlayed: number;
+  totalScore: number;
+}
+
+function getLocalUsers(): LocalUser[] {
+  try {
+    const raw = localStorage.getItem('snake_local_users');
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalUsers(users: LocalUser[]) {
+  try {
+    localStorage.setItem('snake_local_users', JSON.stringify(users));
+  } catch {
+    // ignore
+  }
+}
+
 interface GameStore {
   socket: Socket | null;
   gameState: GameState | null;
@@ -54,21 +83,138 @@ interface GameStore {
 
 export const globalGameState: { current: GameState | null } = { current: null };
 let lastUiUpdate = 0;
+let offlineTickTimer: ReturnType<typeof setInterval> | null = null;
 
 function createInitialOfflineState(): GameState {
-  const orbs: Record<string, { x: number; y: number; color: string }> = {};
+  const orbs: Record<string, { id: string; x: number; y: number; value: number; color: string }> = {};
   for (let i = 0; i < 200; i++) {
-    orbs[`orb_${i}`] = {
+    const id = `orb_${i}`;
+    orbs[id] = {
+      id,
       x: (Math.random() - 0.5) * 180,
       y: (Math.random() - 0.5) * 180,
+      value: 1,
       color: CELL_COLORS[Math.floor(Math.random() * CELL_COLORS.length)],
     };
   }
+
+  const players: Record<string, Player> = {};
+  BOT_NAMES.forEach((name, idx) => {
+    const botId = `bot_${idx}`;
+    const startX = (Math.random() - 0.5) * 120;
+    const startY = (Math.random() - 0.5) * 120;
+    const angle = Math.random() * Math.PI * 2;
+    const initialScore = 15 + Math.floor(Math.random() * 25);
+    const segments = [];
+    for (let s = 0; s < initialScore; s++) {
+      segments.push({
+        x: startX - Math.cos(angle) * s * 0.8,
+        y: startY - Math.sin(angle) * s * 0.8,
+      });
+    }
+
+    players[botId] = {
+      id: botId,
+      name,
+      color: CELL_COLORS[(idx + 1) % CELL_COLORS.length],
+      score: initialScore,
+      segments,
+      isBoosting: false,
+      state: 'alive',
+      currentAngle: angle,
+      inputs: { left: false, right: false, boost: false },
+    };
+  });
+
+  const leaderboard = Object.values(players)
+    .map(p => ({ id: p.id, name: p.name, score: Math.floor(p.score), color: p.color }))
+    .sort((a, b) => b.score - a.score);
+
   return {
-    players: {},
+    players,
     orbs,
-    leaderboard: [],
+    leaderboard,
   };
+}
+
+function startOfflineSimulation(set: any, get: any) {
+  if (offlineTickTimer) return;
+
+  offlineTickTimer = setInterval(() => {
+    const socket = get().socket;
+    if (socket && socket.connected) return; // Online mode server handles state
+
+    const gs = globalGameState.current;
+    if (!gs) return;
+
+    const dt = 0.08;
+    const speed = 12;
+
+    // Move AI Bots
+    Object.values(gs.players).forEach((p) => {
+      if (p.id.startsWith('bot_') && p.state === 'alive') {
+        if (Math.random() < 0.1) {
+          p.currentAngle += (Math.random() - 0.5) * 0.8;
+        }
+
+        const head = { ...p.segments[0] };
+        head.x += Math.cos(p.currentAngle) * speed * dt;
+        head.y += Math.sin(p.currentAngle) * speed * dt;
+
+        const b = 75;
+        if (Math.abs(head.x) > b || Math.abs(head.y) > b) {
+          p.currentAngle += Math.PI * 0.7;
+          head.x = Math.max(-b, Math.min(b, head.x));
+          head.y = Math.max(-b, Math.min(b, head.y));
+        }
+
+        p.segments.unshift(head);
+        const targetLen = Math.max(10, Math.floor(p.score));
+        while (p.segments.length > targetLen) {
+          p.segments.pop();
+        }
+
+        // Bot orb eating
+        for (const orbId in gs.orbs) {
+          const orb = gs.orbs[orbId];
+          const dx = head.x - orb.x;
+          const dy = head.y - orb.y;
+          if (dx * dx + dy * dy < 4) {
+            p.score += 1;
+            delete gs.orbs[orbId];
+            const newOrbId = `orb_${Date.now()}_${Math.random()}`;
+            gs.orbs[newOrbId] = {
+              id: newOrbId,
+              x: (Math.random() - 0.5) * 160,
+              y: (Math.random() - 0.5) * 160,
+              value: 1,
+              color: CELL_COLORS[Math.floor(Math.random() * CELL_COLORS.length)],
+            };
+            break;
+          }
+        }
+      }
+    });
+
+    // Compute Live Leaderboard
+    const sortedLeaderboard = Object.values(gs.players)
+      .filter((p) => p.state === 'alive')
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        score: Math.floor(p.score),
+        color: p.color,
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    gs.leaderboard = sortedLeaderboard;
+
+    const now = Date.now();
+    if (now - lastUiUpdate > 80) {
+      set({ gameState: { ...gs } });
+      lastUiUpdate = now;
+    }
+  }, 80);
 }
 
 export const useGameStore = create<GameStore>((set, get) => ({
@@ -95,8 +241,10 @@ export const useGameStore = create<GameStore>((set, get) => ({
       set({ gameState: { ...globalGameState.current } });
     }
 
-    const isFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
-    const serverUrl = isFile ? 'http://localhost:3000' : undefined;
+    startOfflineSimulation(set, get);
+
+    const isFile = typeof window !== 'undefined' && (window.location.protocol === 'file:' || window.location.hostname.includes('github.io'));
+    const serverUrl = isFile ? undefined : undefined;
 
     const socket = io(serverUrl, {
       transports: ['websocket', 'polling'],
@@ -122,7 +270,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
       const currentPlayer = myId ? state.players[myId] : null;
       const prevPlayer = myId ? get().gameState?.players[myId] : null;
 
-      // Force immediate update if player state changed (e.g. joined, respawned, or died)
       const stateChanged = currentPlayer?.state !== prevPlayer?.state || !get().gameState;
 
       if (stateChanged || now - lastUiUpdate > 80) {
@@ -140,87 +287,185 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const token = get().token;
     if (!token) return;
 
+    if (token.startsWith('local_token_')) {
+      const userId = token.replace('local_token_', '');
+      const users = getLocalUsers();
+      const found = users.find((u) => u.id === userId);
+      if (found) {
+        set({
+          currentUser: {
+            id: found.id,
+            username: found.username,
+            color: found.color,
+            highScore: found.highScore,
+            gamesPlayed: found.gamesPlayed,
+            totalScore: found.totalScore,
+          },
+          authError: null,
+        });
+        return;
+      }
+    }
+
     try {
-      const isFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
-      const apiPrefix = isFile ? 'http://localhost:3000' : '';
-      const res = await fetch(`${apiPrefix}/api/auth/me`, {
+      const res = await fetch('/api/auth/me', {
         headers: { Authorization: `Bearer ${token}` }
       });
-      const data = await res.json();
-      if (data.success && data.user) {
-        set({ currentUser: data.user, authError: null });
-      } else {
-        localStorage.removeItem('snake_auth_token');
-        set({ currentUser: null, token: null });
+      const contentType = res.headers.get('content-type');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success && data.user) {
+          set({ currentUser: data.user, authError: null });
+          return;
+        }
       }
     } catch {
-      // Ignore network failures for local session fallback
+      // Fallback
     }
   },
 
   login: async (username, password) => {
     set({ authLoading: true, authError: null });
+    const cleanUsername = username.trim();
+
     try {
-      const isFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
-      const apiPrefix = isFile ? 'http://localhost:3000' : '';
-      const res = await fetch(`${apiPrefix}/api/auth/login`, {
+      const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username: cleanUsername, password })
       });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        set({ authError: data.error || 'Login failed', authLoading: false });
-        return false;
+      const contentType = res.headers.get('content-type');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success) {
+          localStorage.setItem('snake_auth_token', data.token);
+          set({
+            currentUser: data.user,
+            token: data.token,
+            authModalOpen: false,
+            authLoading: false,
+            authError: null
+          });
+          get().fetchGlobalLeaderboard();
+          return true;
+        } else {
+          set({ authError: data.error || 'Login failed', authLoading: false });
+          return false;
+        }
       }
+    } catch {
+      // Server endpoint unavailable (e.g. static GitHub Pages)
+    }
 
-      localStorage.setItem('snake_auth_token', data.token);
+    // Local storage account fallback
+    const users = getLocalUsers();
+    const found = users.find(u => u.username.toLowerCase() === cleanUsername.toLowerCase());
+    if (found && found.passwordHash === password) {
+      const token = `local_token_${found.id}`;
+      localStorage.setItem('snake_auth_token', token);
       set({
-        currentUser: data.user,
-        token: data.token,
+        currentUser: {
+          id: found.id,
+          username: found.username,
+          color: found.color,
+          highScore: found.highScore,
+          gamesPlayed: found.gamesPlayed,
+          totalScore: found.totalScore,
+        },
+        token,
         authModalOpen: false,
         authLoading: false,
         authError: null
       });
       get().fetchGlobalLeaderboard();
       return true;
-    } catch {
-      set({ authError: 'Server error. Please try again.', authLoading: false });
+    } else {
+      set({ authError: 'Invalid username or password', authLoading: false });
       return false;
     }
   },
 
   register: async (username, password, color) => {
     set({ authLoading: true, authError: null });
-    try {
-      const selectedColor = color || get().guestColor;
-      const isFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
-      const apiPrefix = isFile ? 'http://localhost:3000' : '';
-      const res = await fetch(`${apiPrefix}/api/auth/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password, color: selectedColor })
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        set({ authError: data.error || 'Registration failed', authLoading: false });
-        return false;
-      }
+    const selectedColor = color || get().guestColor;
+    const cleanUsername = username.trim();
 
-      localStorage.setItem('snake_auth_token', data.token);
-      set({
-        currentUser: data.user,
-        token: data.token,
-        authModalOpen: false,
-        authLoading: false,
-        authError: null
-      });
-      get().fetchGlobalLeaderboard();
-      return true;
-    } catch {
-      set({ authError: 'Server error. Please try again.', authLoading: false });
+    if (!cleanUsername || cleanUsername.length < 3) {
+      set({ authError: 'Username must be at least 3 characters', authLoading: false });
       return false;
     }
+    if (!password || password.length < 4) {
+      set({ authError: 'Password must be at least 4 characters', authLoading: false });
+      return false;
+    }
+
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: cleanUsername, password, color: selectedColor })
+      });
+      const contentType = res.headers.get('content-type');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success) {
+          localStorage.setItem('snake_auth_token', data.token);
+          set({
+            currentUser: data.user,
+            token: data.token,
+            authModalOpen: false,
+            authLoading: false,
+            authError: null
+          });
+          get().fetchGlobalLeaderboard();
+          return true;
+        } else {
+          set({ authError: data.error || 'Registration failed', authLoading: false });
+          return false;
+        }
+      }
+    } catch {
+      // Fallback to local storage account
+    }
+
+    // Local storage account creation
+    const users = getLocalUsers();
+    if (users.some(u => u.username.toLowerCase() === cleanUsername.toLowerCase())) {
+      set({ authError: 'Username is already taken', authLoading: false });
+      return false;
+    }
+
+    const newUser: LocalUser = {
+      id: `local_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+      username: cleanUsername,
+      passwordHash: password,
+      color: selectedColor,
+      highScore: 0,
+      gamesPlayed: 0,
+      totalScore: 0,
+    };
+
+    users.push(newUser);
+    saveLocalUsers(users);
+
+    const token = `local_token_${newUser.id}`;
+    localStorage.setItem('snake_auth_token', token);
+    set({
+      currentUser: {
+        id: newUser.id,
+        username: newUser.username,
+        color: newUser.color,
+        highScore: newUser.highScore,
+        gamesPlayed: newUser.gamesPlayed,
+        totalScore: newUser.totalScore,
+      },
+      token,
+      authModalOpen: false,
+      authLoading: false,
+      authError: null
+    });
+    get().fetchGlobalLeaderboard();
+    return true;
   },
 
   logout: () => {
@@ -240,25 +485,31 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
 
   updateUserColor: async (color) => {
-    const { token } = get();
-    if (token) {
-      try {
-        const isFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
-        const apiPrefix = isFile ? 'http://localhost:3000' : '';
-        const res = await fetch(`${apiPrefix}/api/auth/update-color`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`
-          },
-          body: JSON.stringify({ color })
-        });
-        const data = await res.json();
-        if (data.success && data.user) {
-          set({ currentUser: data.user });
+    const { token, currentUser } = get();
+    if (currentUser) {
+      const updated = { ...currentUser, color };
+      set({ currentUser: updated });
+
+      if (token && token.startsWith('local_token_')) {
+        const users = getLocalUsers();
+        const idx = users.findIndex(u => u.id === currentUser.id);
+        if (idx !== -1) {
+          users[idx].color = color;
+          saveLocalUsers(users);
         }
-      } catch (e) {
-        console.error('Failed to update color', e);
+      } else if (token) {
+        try {
+          await fetch('/api/auth/update-color', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`
+            },
+            body: JSON.stringify({ color })
+          });
+        } catch (e) {
+          console.error('Failed to update color', e);
+        }
       }
     } else {
       get().setGuestColor(color);
@@ -275,16 +526,25 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   fetchGlobalLeaderboard: async () => {
     try {
-      const isFile = typeof window !== 'undefined' && window.location.protocol === 'file:';
-      const apiPrefix = isFile ? 'http://localhost:3000' : '';
-      const res = await fetch(`${apiPrefix}/api/leaderboard/global`);
-      const data = await res.json();
-      if (data.success && Array.isArray(data.leaderboard)) {
-        set({ globalLeaderboard: data.leaderboard });
+      const res = await fetch('/api/leaderboard/global');
+      const contentType = res.headers.get('content-type');
+      if (res.ok && contentType && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success && Array.isArray(data.leaderboard)) {
+          set({ globalLeaderboard: data.leaderboard });
+          return;
+        }
       }
     } catch {
-      // Ignore
+      // Fallback below
     }
+
+    // Local storage leaderboard
+    const users = getLocalUsers();
+    const leaderboard = users
+      .map((u) => ({ username: u.username, color: u.color, highScore: u.highScore, gamesPlayed: u.gamesPlayed }))
+      .sort((a, b) => b.highScore - a.highScore);
+    set({ globalLeaderboard: leaderboard });
   },
 
   setLeaderboardTab: (tab) => {
@@ -302,7 +562,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
       socket = get().socket;
     }
 
-    // Blur active inputs so arrow/wasd keyboard controls work immediately
     if (typeof document !== 'undefined') {
       (document.activeElement as HTMLElement)?.blur();
       window.focus();
@@ -328,16 +587,42 @@ export const useGameStore = create<GameStore>((set, get) => ({
         globalGameState.current = createInitialOfflineState();
       }
 
+      const spawnX = (Math.random() - 0.5) * 60;
+      const spawnY = (Math.random() - 0.5) * 60;
+      const initialAngle = Math.random() * Math.PI * 2;
+
+      const initialSegments = [];
+      for (let i = 0; i < 10; i++) {
+        initialSegments.push({
+          x: spawnX - Math.cos(initialAngle) * i * 0.8,
+          y: spawnY - Math.sin(initialAngle) * i * 0.8,
+        });
+      }
+
       globalGameState.current.players[localId] = {
         id: localId,
         name: payload.name,
         color: payload.color,
-        score: 0,
-        highScore: 0,
-        segments: [{ x: (Math.random() - 0.5) * 40, y: (Math.random() - 0.5) * 40 }],
-        angle: 0,
+        score: 10,
+        segments: initialSegments,
+        currentAngle: initialAngle,
+        isBoosting: false,
         state: 'alive',
+        inputs: { left: false, right: false, boost: false },
       };
+
+      // Compute Live Leaderboard immediately
+      const sortedLeaderboard = Object.values(globalGameState.current.players)
+        .filter((p) => p.state === 'alive')
+        .map((p) => ({
+          id: p.id,
+          name: p.name,
+          score: Math.floor(p.score),
+          color: p.color,
+        }))
+        .sort((a, b) => b.score - a.score);
+
+      globalGameState.current.leaderboard = sortedLeaderboard;
 
       set({
         playerId: localId,
@@ -347,15 +632,31 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
 
   sendPlayerState: (data) => {
-    const { socket, playerId } = get();
+    const { socket, playerId, currentUser } = get();
     if (socket && socket.connected) {
       socket.emit('update_state', data);
     } else if (playerId && globalGameState.current && globalGameState.current.players[playerId]) {
       const player = globalGameState.current.players[playerId];
       player.segments = data.segments || player.segments;
       player.score = data.score !== undefined ? data.score : player.score;
-      player.angle = data.angle !== undefined ? data.angle : player.angle;
+      player.currentAngle = data.currentAngle !== undefined ? data.currentAngle : player.currentAngle;
+      player.isBoosting = !!data.isBoosting;
       if (data.state) player.state = data.state;
+
+      // Update high score if logged in
+      if (currentUser && Math.floor(player.score) > currentUser.highScore) {
+        const newHigh = Math.floor(player.score);
+        const updatedUser = { ...currentUser, highScore: newHigh };
+        set({ currentUser: updatedUser });
+
+        const users = getLocalUsers();
+        const idx = users.findIndex((u) => u.id === currentUser.id);
+        if (idx !== -1) {
+          users[idx].highScore = newHigh;
+          saveLocalUsers(users);
+        }
+        get().fetchGlobalLeaderboard();
+      }
 
       const now = Date.now();
       if (now - lastUiUpdate > 80) {
@@ -372,12 +673,14 @@ export const useGameStore = create<GameStore>((set, get) => ({
     } else if (globalGameState.current) {
       delete globalGameState.current.orbs[orbId];
       if (playerId && globalGameState.current.players[playerId]) {
-        globalGameState.current.players[playerId].score += 10;
+        globalGameState.current.players[playerId].score += 1;
       }
       const newOrbId = `orb_${Date.now()}_${Math.random()}`;
       globalGameState.current.orbs[newOrbId] = {
+        id: newOrbId,
         x: (Math.random() - 0.5) * 180,
         y: (Math.random() - 0.5) * 180,
+        value: 1,
         color: CELL_COLORS[Math.floor(Math.random() * CELL_COLORS.length)],
       };
       set({ gameState: { ...globalGameState.current } });
