@@ -150,9 +150,35 @@ function startOfflineSimulation(set: any, get: any) {
     const dt = 0.08;
     const speed = 12;
 
+    // Ensure AI bots are active in the arena
+    BOT_NAMES.forEach((name, idx) => {
+      const botId = `bot_${idx}`;
+      if (!gs.players[botId] || gs.players[botId].state !== 'alive' || !gs.players[botId].segments || gs.players[botId].segments.length === 0) {
+        const bx = (Math.random() - 0.5) * 120;
+        const by = (Math.random() - 0.5) * 120;
+        const bAngle = Math.random() * Math.PI * 2;
+        const bScore = 15 + Math.floor(Math.random() * 25);
+        const bSegments = [];
+        for (let s = 0; s < bScore; s++) {
+          bSegments.push({ x: bx - Math.cos(bAngle) * s * 0.8, y: by - Math.sin(bAngle) * s * 0.8 });
+        }
+        gs.players[botId] = {
+          id: botId,
+          name,
+          color: CELL_COLORS[(idx + 1) % CELL_COLORS.length],
+          score: bScore,
+          segments: bSegments,
+          isBoosting: false,
+          state: 'alive',
+          currentAngle: bAngle,
+          inputs: { left: false, right: false, boost: false },
+        };
+      }
+    });
+
     // Move AI Bots
     Object.values(gs.players).forEach((p) => {
-      if (p.id.startsWith('bot_') && p.state === 'alive') {
+      if (p.id.startsWith('bot_') && p.state === 'alive' && p.segments && p.segments.length > 0) {
         if (Math.random() < 0.1) {
           p.currentAngle += (Math.random() - 0.5) * 0.8;
         }
@@ -198,7 +224,7 @@ function startOfflineSimulation(set: any, get: any) {
 
     // Compute Live Leaderboard
     const sortedLeaderboard = Object.values(gs.players)
-      .filter((p) => p.state === 'alive')
+      .filter((p) => p.state === 'alive' && p.segments && p.segments.length > 0)
       .map((p) => ({
         id: p.id,
         name: p.name,
@@ -234,8 +260,6 @@ export const useGameStore = create<GameStore>((set, get) => ({
   leaderboardTab: 'live',
 
   connect: () => {
-    if (get().socket) return;
-    
     if (!globalGameState.current) {
       globalGameState.current = createInitialOfflineState();
       set({ gameState: { ...globalGameState.current } });
@@ -243,42 +267,61 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
     startOfflineSimulation(set, get);
 
-    const isFile = typeof window !== 'undefined' && (window.location.protocol === 'file:' || window.location.hostname.includes('github.io'));
-    const serverUrl = isFile ? undefined : undefined;
+    const isStaticHost = typeof window !== 'undefined' && (
+      window.location.protocol === 'file:' || 
+      window.location.hostname.includes('github.io') ||
+      window.location.hostname.includes('github.app')
+    );
 
-    const socket = io(serverUrl, {
-      transports: ['websocket', 'polling'],
-      autoConnect: true,
-      timeout: 3000,
-    });
+    // Skip socket initialization on static GitHub Pages hosting
+    if (isStaticHost) {
+      get().checkAuthSession();
+      get().fetchGlobalLeaderboard();
+      return;
+    }
 
-    socket.on('connect', () => {
-      console.log('Connected to server');
-    });
+    if (get().socket) return;
 
-    socket.on('init', (id: string) => {
-      set({ playerId: id });
-      if (globalGameState.current) {
-        set({ gameState: { ...globalGameState.current } });
-      }
-    });
+    try {
+      const socket = io({
+        transports: ['websocket', 'polling'],
+        autoConnect: true,
+        timeout: 3000,
+      });
 
-    socket.on('state', (state: GameState) => {
-      globalGameState.current = state;
-      const now = Date.now();
-      const myId = get().playerId;
-      const currentPlayer = myId ? state.players[myId] : null;
-      const prevPlayer = myId ? get().gameState?.players[myId] : null;
+      socket.on('connect', () => {
+        console.log('Connected to server');
+      });
 
-      const stateChanged = currentPlayer?.state !== prevPlayer?.state || !get().gameState;
+      socket.on('init', (id: string) => {
+        set({ playerId: id });
+        if (globalGameState.current) {
+          set({ gameState: { ...globalGameState.current } });
+        }
+      });
 
-      if (stateChanged || now - lastUiUpdate > 80) {
-        set({ gameState: state });
-        lastUiUpdate = now;
-      }
-    });
+      socket.on('state', (state: GameState) => {
+        if (state && state.players) {
+          globalGameState.current = state;
+          const now = Date.now();
+          const myId = get().playerId;
+          const currentPlayer = myId ? state.players[myId] : null;
+          const prevPlayer = myId ? get().gameState?.players[myId] : null;
 
-    set({ socket });
+          const stateChanged = currentPlayer?.state !== prevPlayer?.state || !get().gameState;
+
+          if (stateChanged || now - lastUiUpdate > 80) {
+            set({ gameState: state });
+            lastUiUpdate = now;
+          }
+        }
+      });
+
+      set({ socket });
+    } catch {
+      // Socket creation failed, offline mode active
+    }
+
     get().checkAuthSession();
     get().fetchGlobalLeaderboard();
   },
@@ -571,21 +614,46 @@ export const useGameStore = create<GameStore>((set, get) => ({
       ? { name: currentUser.username, color: currentUser.color || '#ffffff', userId: currentUser.id }
       : { name: guestName, color: guestColor || '#ffffff' };
 
-    if (socket && socket.connected) {
+    const isStaticHost = typeof window !== 'undefined' && (
+      window.location.protocol === 'file:' || 
+      window.location.hostname.includes('github.io') ||
+      window.location.hostname.includes('github.app')
+    );
+
+    if (socket && socket.connected && !isStaticHost) {
       socket.emit('join', payload);
     } else {
-      if (socket) {
-        socket.once('connect', () => {
-          socket.emit('join', payload);
-        });
-        socket.connect();
-      }
-
       // Offline / immediate local join so game starts instantly on PLAY NOW click
       const localId = playerId || `local_${Math.floor(Math.random() * 100000)}`;
       if (!globalGameState.current) {
         globalGameState.current = createInitialOfflineState();
       }
+
+      // Ensure bots exist
+      BOT_NAMES.forEach((name, idx) => {
+        const botId = `bot_${idx}`;
+        if (!globalGameState.current!.players[botId] || globalGameState.current!.players[botId].state !== 'alive') {
+          const bx = (Math.random() - 0.5) * 120;
+          const by = (Math.random() - 0.5) * 120;
+          const bAngle = Math.random() * Math.PI * 2;
+          const bScore = 15 + Math.floor(Math.random() * 25);
+          const bSegments = [];
+          for (let s = 0; s < bScore; s++) {
+            bSegments.push({ x: bx - Math.cos(bAngle) * s * 0.8, y: by - Math.sin(bAngle) * s * 0.8 });
+          }
+          globalGameState.current!.players[botId] = {
+            id: botId,
+            name,
+            color: CELL_COLORS[(idx + 1) % CELL_COLORS.length],
+            score: bScore,
+            segments: bSegments,
+            isBoosting: false,
+            state: 'alive',
+            currentAngle: bAngle,
+            inputs: { left: false, right: false, boost: false },
+          };
+        }
+      });
 
       const spawnX = (Math.random() - 0.5) * 60;
       const spawnY = (Math.random() - 0.5) * 60;
@@ -613,7 +681,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
       // Compute Live Leaderboard immediately
       const sortedLeaderboard = Object.values(globalGameState.current.players)
-        .filter((p) => p.state === 'alive')
+        .filter((p) => p.state === 'alive' && p.segments && p.segments.length > 0)
         .map((p) => ({
           id: p.id,
           name: p.name,
