@@ -372,12 +372,20 @@ export function GameScene() {
       // Initialize from server if not active
       if (!localPlayerRef.current.active && serverPlayer.segments.length > 0) {
         localPlayerRef.current.active = true;
-        localPlayerRef.current.segments = [...serverPlayer.segments];
-        localPlayerRef.current.score = serverPlayer.score;
-        localPlayerRef.current.currentAngle = serverPlayer.currentAngle;
+        localPlayerRef.current.segments = serverPlayer.segments.map(s => ({ x: s.x || 0, y: s.y || 0 }));
+        localPlayerRef.current.score = serverPlayer.score || 10;
+        const validAngle = typeof serverPlayer.currentAngle === 'number' && !isNaN(serverPlayer.currentAngle)
+          ? serverPlayer.currentAngle
+          : ((serverPlayer as any).angle || 0);
+        localPlayerRef.current.currentAngle = validAngle;
       }
 
-      if (!localPlayerRef.current.active) return;
+      
+      if (!localPlayerRef.current.active || localPlayerRef.current.segments.length === 0) return;
+
+      if (isNaN(localPlayerRef.current.currentAngle)) {
+        localPlayerRef.current.currentAngle = 0;
+      }
 
       // Local movement logic
       if (inputs.current.left) localPlayerRef.current.currentAngle += TURN_SPEED * delta;
@@ -387,6 +395,9 @@ export function GameScene() {
       const speed = localPlayerRef.current.isBoosting ? BOOST_SPEED : BASE_SPEED;
       
       const head = { ...localPlayerRef.current.segments[0] };
+      if (isNaN(head.x)) head.x = 0;
+      if (isNaN(head.y)) head.y = 0;
+
       head.x += Math.cos(localPlayerRef.current.currentAngle) * speed * delta;
       head.y += Math.sin(localPlayerRef.current.currentAngle) * speed * delta;
 
